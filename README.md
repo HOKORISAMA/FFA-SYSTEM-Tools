@@ -1,1 +1,1 @@
-### Can unpack and repack BlackPackage Studio's .Dat Archive.
+### Can Unpack and Re-Pack BlackPackage Studio's .Dat Archive.
