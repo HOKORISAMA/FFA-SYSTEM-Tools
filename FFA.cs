@@ -1,21 +1,24 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 using System.Collections.Generic;
-using Utility.Compression;
+using System.Linq;
+using Compression;
 
 namespace FFA
 {
-    public class Entry
+    public class ArchiveEntry
     {
         public string Name { get; set; }
         public uint Size { get; set; }
         public long Offset { get; set; }
+        public int Order { get; set; }  
+    }
 
-        public bool CheckPlacement(long maxOffset)
-        {
-            return Offset >= 0 && Size >= 0 && (Offset + Size) <= maxOffset;
-        }
+    public class ArchiveMetadata
+    {
+        public List<string> FileOrder { get; set; }
     }
 
     public class FFASYSTEM
@@ -23,10 +26,14 @@ namespace FFA
         public void Unpack(string filePath, string folderName)
         {
             string lstFilePath = Path.ChangeExtension(filePath, ".lst");
+            string metadataPath = Path.ChangeExtension(filePath, ".json");
+            
             if (!File.Exists(lstFilePath))
             {
                 throw new FileNotFoundException($"Associated list file not found: {lstFilePath}");
             }
+
+            var fileOrder = new List<string>();
 
             using (FileStream dataFs = new FileStream(filePath, FileMode.Open, FileAccess.Read))
             using (FileStream lstFs = new FileStream(lstFilePath, FileMode.Open, FileAccess.Read))
@@ -39,19 +46,22 @@ namespace FFA
                     throw new InvalidDataException("File Count is not Sane!");
                 }
 
-                var entries = new List<Entry>((int)fileCount);
+                var entries = new List<ArchiveEntry>((int)fileCount);
                 uint indexOffset = 0;
                 for (int i = 0; i < fileCount; i++)
                 {
-                    var entry = new Entry();
+                    var entry = new ArchiveEntry();
                     lstBr.BaseStream.Position = indexOffset;
                     entry.Name = Encoding.ASCII.GetString(lstBr.ReadBytes(14)).TrimEnd('\0');
                     lstBr.BaseStream.Position = indexOffset + 14;
                     entry.Offset = lstBr.ReadUInt32();
                     lstBr.BaseStream.Position = indexOffset + 18;
                     entry.Size = lstBr.ReadUInt32();
+                    entry.Order = i;  // Save original order
 
-                    if (!entry.CheckPlacement(dataFs.Length))
+                    fileOrder.Add(entry.Name);  // Record file order
+
+                    if (!CheckPlacement(entry.Offset, entry.Size, dataFs.Length))
                     {
                         Console.WriteLine($"Warning: Invalid entry placement: {entry.Name}");
                         continue;
@@ -60,6 +70,11 @@ namespace FFA
                     entries.Add(entry);
                     indexOffset += 0x16;
                 }
+
+                // Save file order to JSON
+                var metadata = new ArchiveMetadata { FileOrder = fileOrder };
+                string jsonMetadata = JsonSerializer.Serialize(metadata, new JsonSerializerOptions { WriteIndented = true });
+                File.WriteAllText(metadataPath, jsonMetadata);
 
                 Directory.CreateDirectory(folderName);
 
@@ -81,21 +96,17 @@ namespace FFA
                     {
                         try
                         {
-                            // Read LZSS header
                             int packedSize = dataBr.ReadInt32();
                             int unpackedSize = dataBr.ReadInt32();
 
-                            // Verify header
                             if (packedSize + 8 == entry.Size && packedSize > 0 && unpackedSize > 0)
                             {
-                                // Read compressed data
                                 byte[] compressedData = dataBr.ReadBytes(packedSize);
                                 fileData = Lzss.Decompress(compressedData);
                                 Console.WriteLine($"Decompressed: {entry.Name}");
                             }
                             else
                             {
-                                // Invalid header, treat as regular file
                                 dataBr.BaseStream.Position = entry.Offset;
                                 fileData = dataBr.ReadBytes((int)entry.Size);
                             }
@@ -122,7 +133,7 @@ namespace FFA
                 }
             }
         }
-        
+
         public void Pack(string inputFolder, string outputFile)
         {
             if (!Directory.Exists(inputFolder))
@@ -130,17 +141,20 @@ namespace FFA
                 throw new DirectoryNotFoundException($"Input folder not found: {inputFolder}");
             }
 
-            var files = Directory.GetFiles(inputFolder, "*", SearchOption.AllDirectories);
-            if (files.Length == 0)
+            string metadataPath = Path.ChangeExtension(outputFile, ".json");
+            if (!File.Exists(metadataPath))
             {
-                throw new InvalidOperationException("No files found in input folder");
-            }
-            if (files.Length > 0xFFFF)
-            {
-                throw new InvalidOperationException("Too many files (maximum is 65535)");
+                throw new FileNotFoundException($"Order metadata file not found: {metadataPath}");
             }
 
-            var entries = new List<Entry>();
+            // Read file order from JSON
+            var metadata = JsonSerializer.Deserialize<ArchiveMetadata>(File.ReadAllText(metadataPath));
+            if (metadata?.FileOrder == null || metadata.FileOrder.Count == 0)
+            {
+                throw new InvalidDataException("Invalid or empty file order metadata");
+            }
+
+            var entries = new List<ArchiveEntry>();
             long currentOffset = 0;
 
             string lstFile = Path.ChangeExtension(outputFile, ".lst");
@@ -149,35 +163,34 @@ namespace FFA
             using (BinaryWriter dataBw = new BinaryWriter(dataFs))
             using (BinaryWriter lstBw = new BinaryWriter(lstFs))
             {
-                foreach (string file in files)
+                // Process files in the order specified by metadata
+                foreach (string fileName in metadata.FileOrder)
                 {
-                    byte[] fileData = File.ReadAllBytes(file);
-                    string relativePath = Path.GetRelativePath(inputFolder, file);
-                    string extension = Path.GetExtension(file).ToLowerInvariant();
+                    string filePath = Path.Combine(inputFolder, fileName);
+                    if (!File.Exists(filePath))
+                    {
+                        Console.WriteLine($"Warning: File not found: {fileName}");
+                        continue;
+                    }
+
+                    byte[] fileData = File.ReadAllBytes(filePath);
+                    string extension = Path.GetExtension(fileName).ToLowerInvariant();
 
                     uint finalSize;
                     if (extension == ".so4" || extension == ".so5")
                     {
                         try
                         {
-                            // Compress the data first
                             byte[] compressedData = Lzss.Compress(fileData);
-                            
-                            // Write header: compressed size + uncompressed size
-                            dataBw.Write((int)compressedData.Length);  // packedSize
-                            dataBw.Write((int)fileData.Length);        // unpackedSize
-                            
-                            // Write the compressed data
+                            dataBw.Write(compressedData.Length);
+                            dataBw.Write(fileData.Length);
                             dataBw.Write(compressedData);
-                            
-                            // Total size is compressed data + 8 byte header
                             finalSize = (uint)(compressedData.Length + 8);
-                            
-                            Console.WriteLine($"Compressed: {relativePath} ({fileData.Length} -> {compressedData.Length} bytes)");
+                            Console.WriteLine($"Compressed: {fileName} ({fileData.Length} -> {compressedData.Length} bytes)");
                         }
                         catch (Exception ex)
                         {
-                            Console.WriteLine($"Failed to compress {relativePath}: {ex.Message}");
+                            Console.WriteLine($"Failed to compress {fileName}: {ex.Message}");
                             continue;
                         }
                     }
@@ -187,25 +200,18 @@ namespace FFA
                         finalSize = (uint)fileData.Length;
                     }
 
-                    var entry = new Entry
+                    var entry = new ArchiveEntry
                     {
-                        Name = relativePath,
+                        Name = fileName,
                         Size = finalSize,
                         Offset = currentOffset
                     };
 
-                    if (entry.Name.Length > 14)
-                    {
-                        Console.WriteLine($"Warning: Filename too long, truncating: {entry.Name}");
-                        entry.Name = entry.Name.Substring(0, 14);
-                    }
-
                     entries.Add(entry);
                     currentOffset += finalSize;
-
                 }
 
-                // Write the list file entries
+                // Write list file entries in the same order
                 foreach (var entry in entries)
                 {
                     byte[] nameBytes = new byte[14];
@@ -220,6 +226,11 @@ namespace FFA
             Console.WriteLine($"Created: {outputFile}");
             Console.WriteLine($"Created: {lstFile}");
             Console.WriteLine($"Total files packed: {entries.Count}");
+        }
+
+        private bool CheckPlacement(long offset, uint size, long maxOffset)
+        {
+            return offset >= 0 && size >= 0 && (offset + size) <= maxOffset;
         }
     }
 }
